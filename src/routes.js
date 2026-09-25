@@ -2,8 +2,17 @@
  * HTTP 路由层。只负责解析/校验输入、调用存储模块与物理核心模块、
  * 组织响应。衰减公式一律来自 src/physics，路由层不自行推导。
  */
-import { validateSingleCalcBody, validateSchemeCalcBody, validateRegisterBody, validateNameParam } from './physics/validation.js';
+import {
+  validateSingleCalcBody,
+  validateSchemeCalcBody,
+  validateRegisterBody,
+  validateNameParam,
+  validateInverseBody,
+  validateSchemeInverseBody,
+  resolveAdjustableLayers,
+} from './physics/validation.js';
 import { evaluateShielding } from './physics/multilayer.js';
+import { solveInverseThickness } from './physics/inverse.js';
 import { registerScheme, getScheme, listSchemes } from './storage/schemes.js';
 
 /**
@@ -56,5 +65,47 @@ export function registerRoutes(app, db) {
   app.post('/calculate', async (request) => {
     const { layer, fluenceRate, buildup } = validateSingleCalcBody(request.body);
     return evaluateShielding([layer], { fluenceRate, buildup });
+  });
+
+  /**
+   * 4) 不登记的一次性反解：给目标限值，反求达标所需最小厚度
+   * POST /inverse
+   * body: { layers: [{ mu, x, material?, adjustable, maxX? }],
+   *         target: { metric: 'broadTransmission'|'relativeDoseRate', limit },
+   *         fluenceRate?, buildup? }
+   * 至少一层 adjustable:true；maxX 缺省表示不封顶。
+   * 全部可调层顶到上限仍不达标 → 422 TARGET_UNREACHABLE。
+   */
+  app.post('/inverse', async (request, reply) => {
+    const { layers, target, fluenceRate, buildup } = validateInverseBody(request.body);
+    const result = solveInverseThickness(layers, {
+      metric: target.metric,
+      limit: target.limit,
+      fluenceRate,
+      buildup,
+    });
+    return reply.code(200).send(result);
+  });
+
+  /**
+   * 5) 凭已登记具名方案反解：沿用存好的层结构，只在 adjustable 列出的
+   *    层上求增量，其余层厚度固定不动（其衰减贡献先扣除）。
+   * POST /schemes/:name/inverse
+   * body: { target: { metric, limit },
+   *         adjustable: [0, {index:2,maxX:8}],   // 层序号（从0）或带上限的对象
+   *         fluenceRate?, buildup? }
+   */
+  app.post('/schemes/:name/inverse', async (request, reply) => {
+    const name = validateNameParam(request.params.name);
+    const { adjustable, target, fluenceRate, buildup } = validateSchemeInverseBody(request.body);
+    const scheme = getScheme(db, name); // 不存在在此抛 404
+    const layers = resolveAdjustableLayers(scheme.layers, adjustable);
+    const result = solveInverseThickness(layers, {
+      metric: target.metric,
+      limit: target.limit,
+      fluenceRate,
+      buildup,
+    });
+    return reply.code(200).send({ scheme: name, ...result });
   });
 }

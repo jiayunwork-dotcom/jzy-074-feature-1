@@ -41,3 +41,15 @@ export class UnphysicalResultError extends ShieldError {
     super(message, { statusCode: 422, code: 'UNPHYSICAL_RESULT', details });
   }
 }
+
+/**
+ * 反解特有的失败（422）：目标限值本身合法，但把所有允许加厚的层
+ * 都加到厚度上限后，指标仍压不到限值以下。必须明说无法达标，
+ * 不允许返回越限厚度或无穷大厚度假装成功。details 里带上
+ * 实际能达到的最优值与所需/可达的光学厚度，供调用方核对。
+ */
+export class TargetUnreachableError extends ShieldError {
+  constructor(message, details) {
+    super(message, { statusCode: 422, code: 'TARGET_UNREACHABLE', details });
+  }
+}
