@@ -1,0 +1,17 @@
+{
+  "name": "radiation-shield-service",
+  "version": "1.0.0",
+  "description": "辐射屏蔽核算服务：窄束/宽束透射、积累因子、半值层/十值层、多层屏蔽叠加与具名方案登记",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "fastify": "^4.29.0"
+  }
+}
