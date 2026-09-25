@@ -2,8 +2,9 @@
 
 把核医学 / 工业探伤防护设计中常用的屏蔽换算钉死的 HTTP 服务：给屏蔽材料、
 厚度与入射注量率，返回窄束/宽束透射率、半值层（HVL）、十值层（TVL）、
-总透射率与相对剂量率。支持多层屏蔽叠加、积累因子两种取法，以及具名方案
-登记复用。Node.js 20 + Fastify + 容器内 SQLite（better-sqlite3）。
+总透射率与相对剂量率。支持多层屏蔽叠加、积累因子两种取法、具名方案
+登记复用，以及**按剂量/透射目标限值反求达标所需的最小厚度**。
+Node.js 20 + Fastify + 容器内 SQLite（better-sqlite3）。
 
 ## 物理模型
 
@@ -53,6 +54,23 @@ T_narrow = exp(- Σᵢ μᵢxᵢ )
 **相对剂量率**：剂量率正比于光子注量率，因此相对剂量率在数值上等于宽束
 透射率；`transmittedFluenceRate = incidentFluenceRate · T_broad`。
 
+### 反求最小厚度（为什么不能移项取对数）
+
+反解只把上面的正向核算当黑盒判据，在「附加总光学深度」上做**带界二分**，
+不另抄一套衰减公式：
+
+- 线性近似 `T(y)=(1+ky)e^-y` 在 **k>1 时先增后减**：薄处 `(1+ky)` 的增长
+  压过指数衰减，T 甚至越过 1（正向核算按非物理结果拒绝），之后才单调降到 0。
+  方程 `T=limit` 因此有两个根，解析取对数会拿到上升支上的假根。二分找界时
+  把驼峰段（含 T>1 的非物理段）一律视为「尚未达标」跳过，落在的必然是
+  **下降支**上满足目标的最小厚度。
+- 反解出的厚度会**再走一遍正向核算**返回（响应里的 `forward`），两边对目标
+  的判断严格一致：正向给值必须真的 `<= limit`（不靠容差放过 1 ULP）。
+- 多层时固定层的光学厚度先扣掉，附加光学深度只在 `adjustable: true` 的层间
+  按 `weight`（缺省等权）分配；各层上限受 `maxX` 约束（缺省允许再加
+  100 个 TVL 的光学厚度）。所有可调层顶到上限仍压不到目标时返回
+  422 `TARGET_UNREACHABLE`，details 里给出顶格时实际能达到的有限最优值。
+
 ## 接口（仅 HTTP，无界面）
 
 ### 1. 一次性单层核算（无需登记）
@@ -88,6 +106,40 @@ POST /schemes/:name/calculate
 ```
 
 层结构只登记一次，之后可换不同入射源（注量率）反复算，互不影响。
+
+### 4. 一次性反解（无需登记）：按目标限值求最小厚度
+
+```
+POST /reverse
+{ "layers": [
+    {"material":"brick","mu":0.2,"x":12},                 // 已砌好的固定层
+    {"material":"Pb","mu":2,"x":0,"adjustable":true} ],  // 允许加厚的铅层
+  "target": {"metric": "broadTransmission", "limit": 1e-3}, // 或 "relativeDoseRate"
+  "fluenceRate": 5000,                                       // 可选
+  "buildup": {"mode": "linear", "coefficient": 0.3} }       // 可选，缺省 B=1
+```
+
+可调层可带 `maxX`（厚度上限，不能小于当前 `x`，缺省 = 现厚 + 100 TVL/μ）
+与 `weight`（多层间分配附加光学厚度的权重，必须为正，缺省等权）。
+单层也支持平铺 `{mu, x, adjustable, ...}` 或 `{layer: {...}, target}`。
+
+响应给每层最终厚度、`addedThickness`、`addedOpticalDepth`，以及 `forward`
+——这套厚度代回 `evaluateShielding()` 的完整正向结果，`targetMet` 标明
+正向判定是否达标，`achievable` 汇总达标后的各项指标。
+
+### 5. 凭方案名反解（沿用已登记层结构，只在允许加厚的层上加增量）
+
+```
+POST /schemes/:name/reverse
+{ "target": {"metric": "relativeDoseRate", "limit": 0.01},
+  "adjustable": [ "concrete",                              // 按材料名
+                  {"index": 0, "maxX": 8, "weight": 2} ],  // 或按下标对象
+  "buildup": {"mode": "direct", "value": 2.1} }
+```
+
+`adjustable` 元素可以是层下标（整数）、材料名（字符串），或
+`{index|material, maxX?, weight?}`。不改变登记的方案本体；未标任何可调层
+是 400。所有可调层顶格仍不达标 → 422 `TARGET_UNREACHABLE`。
 
 ### 响应字段
 
@@ -125,16 +177,22 @@ POST /schemes/:name/calculate
 | 404 | `SCHEME_NOT_FOUND` | 方案名不存在 |
 | 409 | `SCHEME_ALREADY_EXISTS` | 方案名重复 |
 | 422 | `UNPHYSICAL_RESULT` | 模型给出透射率 <0 或 >1（不允许当正常结果返回） |
+| 422 | `TARGET_UNREACHABLE` | 反解时可调层全部顶到上限仍压不到目标限值；details 给出有限的 `bestAchievable` |
 
 例如直接指定的 B 在极薄屏蔽处使 B·T > 1 时，服务返回 422 而不是一个
 超过 1 的透射率。线性近似在 0 ≤ k ≤ 1 时恒有 (1+ky)e⁻ʸ ≤ 1。
+
+反解特有的 400 校验：透射率上限必须满足 `0 < limit <= 1`（零透射需要
+无穷厚，不接受），相对剂量率上限不能为负，`target.metric` 必须是
+`broadTransmission` 或 `relativeDoseRate`，且至少一层标明
+`adjustable: true`（方案反解则 `adjustable` 数组不能为空标）。
 
 ## 运行
 
 ```bash
 # 本地
 npm install
-npm test          # node --test，51 个用例
+npm test          # node --test，83 个用例
 npm start         # 默认 :3000，DB 在 ./data/shield.sqlite
 
 # Docker（构建阶段会先跑测试）
@@ -155,6 +213,7 @@ src/
     attenuation.js   核心：exp(-μx)、HVL=ln2/μ、TVL=ln10/μ（唯一公式来源）
     buildup.js       积累因子：direct / linear 两种模式
     multilayer.js    多层叠加（Σμx 统一取指数）+ 完整核算入口 + 物理护栏
+    reverse.js       反求最小厚度：复用 evaluateShielding 做判据的带界二分
     validation.js    参数校验（规则集中一处，聚合所有错误字段）
     errors.js        结构化错误类型
   storage/
@@ -163,11 +222,15 @@ src/
   routes.js          HTTP 路由
   app.js             Fastify 装配 + 错误处理
   index.js           启动入口
-test/                node:test 物理/多层/校验/存储/并发/HTTP 用例
+test/                node:test 物理/多层/反解/校验/存储/并发/HTTP 用例
 ```
 
 单层接口与方案接口都调用 `evaluateShielding()`，衰减公式只有
-`attenuation.js` 一份，不会出现两套不一致的实现。方案存取是同步 SQLite
+`attenuation.js` 一份，不会出现两套不一致的实现。反解
+（`reverseSolve()`）同样不碰衰减公式：它反复调用同一个
+`evaluateShielding()` 当达标判据，反解出的厚度再由它做一次 round-trip
+核算返回，因此不可能出现「反解说达标、正向算出却超限」的口径漂移。
+方案存取是同步 SQLite
 调用，配合 Node 单线程事件循环，请求间不会把甲方案的厚度串进乙方案；
 并发隔离有专门测试（30 个方案并发登记 + 交错核算）。
 

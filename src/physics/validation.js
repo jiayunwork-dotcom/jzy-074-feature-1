@@ -84,6 +84,63 @@ function validateLayer(layer, index, c, fieldPrefix = `layers[${index}]`) {
 }
 
 /**
+ * 校验反解接口的一层：在普通层基础上多三个可选字段——
+ *  - adjustable：是否允许加厚（布尔）；
+ *  - maxX：可调层允许加到的厚度上限，必须是 >= x 的有限数；
+ *  - weight：可调层之间分配附加光学厚度的权重，必须为正。
+ * @returns {{ material: string, mu: number, x: number, adjustable: boolean, maxX?: number, weight?: number } | null}
+ */
+function validateReverseLayer(layer, index, c, fieldPrefix = `layers[${index}]`) {
+  const base = validateLayer(layer, index, c, fieldPrefix);
+  if (layer === null || typeof layer !== 'object' || Array.isArray(layer)) return null;
+
+  let adjustable = false;
+  if (layer.adjustable !== undefined) {
+    if (typeof layer.adjustable !== 'boolean') {
+      c.add(`${fieldPrefix}.adjustable`, '必须是布尔值');
+    } else {
+      adjustable = layer.adjustable;
+    }
+  }
+
+  let maxX;
+  if (layer.maxX !== undefined) {
+    const ok = c.checkFiniteNumber(`${fieldPrefix}.maxX`, layer.maxX, { nonNegative: true });
+    if (ok) {
+      if (base && layer.maxX < base.x) {
+        c.add(`${fieldPrefix}.maxX`, '不能小于当前厚度 x（反解只允许加厚）');
+      } else {
+        maxX = layer.maxX;
+      }
+    }
+  }
+
+  let weight;
+  if (layer.weight !== undefined) {
+    const ok = c.checkFiniteNumber(`${fieldPrefix}.weight`, layer.weight, { positive: true });
+    if (ok) weight = layer.weight;
+  }
+
+  if (!base) return null;
+  return { ...base, adjustable, ...(maxX !== undefined ? { maxX } : {}), ...(weight !== undefined ? { weight } : {}) };
+}
+
+/** 仅收集反解层问题到给定 collector。 */
+function collectReverseLayers(raw, c, { minLayers = 1 } = {}) {
+  if (!Array.isArray(raw)) {
+    c.add('layers', '必须是非空数组，每层包含 mu 与 x');
+    return [];
+  }
+  if (raw.length < minLayers) {
+    c.add('layers', `至少需要 ${minLayers} 层`);
+  }
+  if (raw.length > MAX_LAYERS) {
+    c.add('layers', `层数不能超过 ${MAX_LAYERS}`);
+  }
+  return raw.map((layer, i) => validateReverseLayer(layer, i, c)).filter(Boolean);
+}
+
+/**
  * 校验并归一化层列表。
  * @param {any} raw
  * @param {{ minLayers?: number }} [options]
@@ -223,4 +280,152 @@ function validateBuildup(raw, c) {
   }
   c.add('buildup.mode', "必须是 'direct' 或 'linear'");
   return { mode: 'direct', value: 1 };
+}
+
+/**
+ * 反解目标校验。两种目标：
+ *  - { metric: 'broadTransmission', limit } 宽束透射率上限，必须落在 (0, 1]；
+ *  - { metric: 'relativeDoseRate', limit } 相对剂量率上限，必须是 [0, 1] 内的有限数
+ *    （相对剂量率无量纲时数值即宽束透射率，物理上限就是 1；0 意味着要求完全屏蔽，
+ *    有限厚度下不可达，交由反解按 TARGET_UNREACHABLE 回报）。
+ * limit 必须严格大于 0（透射率目标）——0 厚度永远给不出零透射。
+ */
+export function validateTarget(raw, c, field = 'target') {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    c.add(field, "必须是 { metric, limit }，metric 取 'broadTransmission' 或 'relativeDoseRate'");
+    return { metric: 'broadTransmission', limit: 1 };
+  }
+  if (raw.metric !== 'broadTransmission' && raw.metric !== 'relativeDoseRate') {
+    c.add(`${field}.metric`, "必须是 'broadTransmission' 或 'relativeDoseRate'");
+  }
+  const metric = raw.metric;
+  const ok = c.checkFiniteNumber(`${field}.limit`, raw.limit, {});
+  let limit = raw.limit;
+  if (ok) {
+    if (metric === 'broadTransmission' && (limit <= 0 || limit > 1)) {
+      c.add(`${field}.limit`, '宽束透射率上限必须落在零到一之间（0 < limit <= 1）');
+    }
+    if (metric === 'relativeDoseRate' && (limit < 0 || limit > 1)) {
+      c.add(`${field}.limit`, '相对剂量率上限不能为负，且不超过一');
+    }
+  }
+  return { metric: metric === 'relativeDoseRate' ? 'relativeDoseRate' : 'broadTransmission', limit };
+}
+
+/**
+ * 反解接口共用校验：目标 + 已归一化的层列表 + 注量率/积累因子，
+ * 并补反解特有约束——至少有一层允许加厚。
+ */
+function finalizeReverseBody(c, layers, body) {
+  const target = validateTarget(body.target, c);
+  const fluenceRate = validateFluenceRate(body.fluenceRate, c);
+  const buildup = validateBuildup(body.buildup, c);
+  if (layers.length > 0 && !layers.some((l) => l.adjustable)) {
+    c.add('layers', '反解至少需要一层标明 adjustable: true（没有可调层就无从加厚）');
+  }
+  c.throwIfAny();
+  return { layers, target, fluenceRate, buildup };
+}
+
+/**
+ * 一次性反解接口输入校验。
+ * 支持 { layers: [...] } 多层写法，或单层平铺 { mu, x, adjustable, ... } / { layer: {...} }。
+ */
+export function validateReverseBody(body) {
+  const c = new FieldCollector();
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    c.add('body', '必须是 JSON 对象');
+    c.throwIfAny();
+  }
+  let layers;
+  if (body.layer !== undefined) {
+    layers = collectReverseLayers([body.layer], c, { minLayers: 1 });
+  } else if (body.layers !== undefined) {
+    layers = collectReverseLayers(body.layers, c);
+  } else {
+    // 单层平铺。
+    layers = collectReverseLayers(
+      [{
+        mu: body.mu, x: body.x, material: body.material,
+        adjustable: body.adjustable, maxX: body.maxX, weight: body.weight,
+      }],
+      c,
+      { minLayers: 1 },
+    );
+  }
+  return finalizeReverseBody(c, layers, body);
+}
+
+/**
+ * 凭已登记方案反解的 body 校验：目标 + 可选的可调层覆盖参数。
+ * 层的 μ/x 取自存储的方案；请求体可用 adjustable 数组按层下标（或 material 名）
+ * 标明哪些层允许加厚，并覆盖 maxX/weight。
+ * 形状：{ target, fluenceRate?, buildup?, adjustable?: number[] | string[] | Array<{index|material, maxX?, weight?}> }
+ */
+export function validateSchemeReverseBody(body, schemeLayers) {
+  const c = new FieldCollector();
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    c.add('body', '必须是 JSON 对象');
+    c.throwIfAny();
+  }
+
+  const layers = schemeLayers.map((l, i) => ({ ...l, adjustable: false }));
+  const marks = body.adjustable;
+  if (marks !== undefined) {
+    if (!Array.isArray(marks)) {
+      c.add('adjustable', '必须是数组：层下标、材料名或 {index|material, maxX?, weight?} 列表');
+    } else {
+      marks.forEach((mark, j) => {
+        const field = `adjustable[${j}]`;
+        if (typeof mark === 'number') {
+          if (!Number.isInteger(mark) || mark < 0 || mark >= layers.length) {
+            c.add(field, `层下标必须在 0..${layers.length - 1} 之间`);
+            return;
+          }
+          layers[mark].adjustable = true;
+        } else if (typeof mark === 'string') {
+          const hit = layers.findIndex((l) => l.material === mark);
+          if (hit < 0) {
+            c.add(field, `方案中没有材料名为 '${mark}' 的层`);
+            return;
+          }
+          layers[hit].adjustable = true;
+        } else if (mark !== null && typeof mark === 'object') {
+          let idx = -1;
+          if (mark.index !== undefined) {
+            if (!Number.isInteger(mark.index) || mark.index < 0 || mark.index >= layers.length) {
+              c.add(`${field}.index`, `层下标必须在 0..${layers.length - 1} 之间`);
+            } else {
+              idx = mark.index;
+            }
+          } else if (typeof mark.material === 'string') {
+            idx = layers.findIndex((l) => l.material === mark.material);
+            if (idx < 0) c.add(`${field}.material`, `方案中没有材料名为 '${mark.material}' 的层`);
+          } else {
+            c.add(field, '必须给出 index 或 material');
+          }
+          if (idx >= 0) {
+            layers[idx].adjustable = true;
+            if (mark.maxX !== undefined) {
+              if (c.checkFiniteNumber(`${field}.maxX`, mark.maxX, { nonNegative: true })
+                && mark.maxX < layers[idx].x) {
+                c.add(`${field}.maxX`, '不能小于该层当前厚度 x（反解只允许加厚）');
+              } else {
+                layers[idx].maxX = mark.maxX;
+              }
+            }
+            if (mark.weight !== undefined) {
+              if (c.checkFiniteNumber(`${field}.weight`, mark.weight, { positive: true })) {
+                layers[idx].weight = mark.weight;
+              }
+            }
+          }
+        } else {
+          c.add(field, '必须是层下标（整数）、材料名（字符串）或 {index|material, maxX?, weight?}');
+        }
+      });
+    }
+  }
+
+  return finalizeReverseBody(c, layers, body);
 }

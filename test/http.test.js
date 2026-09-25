@@ -243,3 +243,194 @@ test('多层堆叠方案：统一指数，且与逐层相乘可分辨', async ()
   assert.equal(b.narrowTransmission, Math.exp(-2.25));
   assert.notEqual(b.narrowTransmission, Math.exp(-0.25) * Math.exp(-2));
 });
+
+// ---------- 反求厚度接口 ----------
+
+test('POST /reverse：一次性反解，厚度代回严格达标且削薄即越限', async () => {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: {
+      layers: [{ material: 'Pb', mu: 1, x: 0, adjustable: true }],
+      target: { metric: 'broadTransmission', limit: 0.1 },
+      buildup: { mode: 'direct', value: 1 },
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const b = res.json();
+  assert.ok(Math.abs(b.layers[0].x - Math.LN10) < 1e-9);
+  // 正向重算严格 <= 限值（不是靠容差放过 1 ULP）。
+  assert.ok(b.forward.broadTransmission <= 0.1);
+  assert.equal(b.targetMet, true);
+  assert.equal(b.reachable, true);
+  assert.ok(b.addedOpticalDepth > 0);
+  // 削薄一丁点 → 越过限值。
+  const shaved = b.layers.map((l) => ({ material: l.material, mu: l.mu, x: l.x }));
+  shaved[0].x -= 1e-9;
+  const check = await app.inject({
+    method: 'POST',
+    url: '/calculate',
+    payload: { layer: shaved[0], buildup: { mode: 'direct', value: 1 } },
+  });
+  assert.ok(check.json().broadTransmission > 0.1);
+});
+
+test('POST /reverse：线性 k>1 驼峰场景解在下降支，round-trip 达标', async () => {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: {
+      layers: [{ mu: 1, x: 0, adjustable: true }],
+      target: { metric: 'broadTransmission', limit: 0.1 },
+      buildup: { mode: 'linear', coefficient: 3 },
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const b = res.json();
+  assert.ok(b.totalOpticalDepth > 2 / 3, '必须越过驼峰峰值点');
+  assert.ok(b.forward.broadTransmission <= 0.1);
+  assert.equal(b.forward.buildupBasis.mode, 'linear');
+});
+
+test('POST /reverse：多层固定+可调，固定层不动、增量按权重', async () => {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: {
+      layers: [
+        { material: 'Pb', mu: 2, x: 0.5 },
+        { material: 'conc', mu: 0.5, x: 0, adjustable: true, weight: 1 },
+        { material: 'fe', mu: 1, x: 0, adjustable: true, weight: 3 },
+      ],
+      target: { metric: 'broadTransmission', limit: 0.01 },
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const b = res.json();
+  assert.equal(b.layers[0].x, 0.5);
+  assert.equal(b.layers[0].addedThickness, 0);
+  const odConc = b.layers[1].mu * b.layers[1].x;
+  const odFe = b.layers[2].mu * b.layers[2].x;
+  assert.ok(Math.abs(odFe / odConc - 3) < 1e-9);
+  assert.ok(b.forward.broadTransmission <= 0.01);
+});
+
+test('POST /reverse：相对剂量率目标 + 入射注量率，回算出射注量率', async () => {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: {
+      layer: { mu: 0.5, x: 0, adjustable: true },
+      target: { metric: 'relativeDoseRate', limit: 0.25 },
+      fluenceRate: 800,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const b = res.json();
+  assert.ok(b.forward.relativeDoseRate <= 0.25);
+  assert.ok(Math.abs(b.forward.transmittedFluenceRate - 200) < 1e-9);
+});
+
+test('POST /reverse：顶到上限仍不达标 → 422 TARGET_UNREACHABLE，不返回越限厚度', async () => {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: {
+      layers: [{ mu: 1, x: 0, adjustable: true, maxX: 1 }],
+      target: { metric: 'broadTransmission', limit: 0.01 },
+    },
+  });
+  assert.equal(res.statusCode, 422);
+  const b = res.json();
+  assert.equal(b.code, 'TARGET_UNREACHABLE');
+  assert.ok(Number.isFinite(b.details.bestAchievable));
+  assert.ok(b.details.bestAchievable > 0.01);
+  assert.ok(Number.isFinite(b.details.maxedLayers[0].x));
+});
+
+test('POST /reverse：非法目标/无可调层 → 400 逐字段结构化错误', async () => {
+  const r1 = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: { layers: [{ mu: 1, x: 0, adjustable: true }], target: { metric: 'broadTransmission', limit: 0 } },
+  });
+  assert.equal(r1.statusCode, 400);
+  assert.equal(r1.json().code, 'VALIDATION_ERROR');
+  assert.ok(r1.json().details.some((d) => d.field === 'target.limit'));
+
+  const r2 = await app.inject({
+    method: 'POST',
+    url: '/reverse',
+    payload: { layers: [{ mu: 1, x: 0 }], target: { metric: 'relativeDoseRate', limit: -0.5 } },
+  });
+  assert.equal(r2.statusCode, 400);
+  const fields = r2.json().details.map((d) => d.field).sort();
+  assert.deepEqual(fields, ['layers', 'target.limit']);
+});
+
+test('POST /schemes/:name/reverse：沿用已登记层结构，只在指定层上加增量', async () => {
+  await app.inject({
+    method: 'POST',
+    url: '/schemes',
+    payload: {
+      name: 'rev-wall',
+      layers: [
+        { material: 'Pb', mu: 2, x: 1 },      // 固定
+        { material: 'concrete', mu: 0.5, x: 4 }, // 允许加厚
+      ],
+    },
+  });
+  // 现状总 od = 2+2 = 4，T=e^-4≈0.0183；压到 0.001 需 od≈6.9078。
+  const res = await app.inject({
+    method: 'POST',
+    url: '/schemes/rev-wall/reverse',
+    payload: { target: { metric: 'broadTransmission', limit: 0.001 }, adjustable: ['concrete'] },
+  });
+  assert.equal(res.statusCode, 200);
+  const b = res.json();
+  assert.equal(b.scheme, 'rev-wall');
+  assert.equal(b.layers[0].x, 1); // Pb 固定
+  assert.ok(b.layers[1].x > 4); // concrete 加厚
+  assert.ok(Math.abs(b.layers[0].mu * b.layers[0].x - 2) < 1e-12);
+  assert.ok(b.forward.broadTransmission <= 0.001);
+  // 登记的方案本身不被改写。
+  const got = await app.inject({ method: 'GET', url: '/schemes/rev-wall' });
+  assert.deepEqual(got.json().layers[1], { material: 'concrete', mu: 0.5, x: 4 });
+});
+
+test('POST /schemes/:name/reverse：下标/对象标记与 maxX 上限生效', async () => {
+  await app.inject({
+    method: 'POST',
+    url: '/schemes',
+    payload: { name: 'rev-cap', layers: [{ material: 'Pb', mu: 1, x: 0.2 }] },
+  });
+  // 只允许加到 x=1，最好成绩 e^-1≈0.368，压不到 0.01 → 422。
+  const res = await app.inject({
+    method: 'POST',
+    url: '/schemes/rev-cap/reverse',
+    payload: {
+      target: { metric: 'broadTransmission', limit: 0.01 },
+      adjustable: [{ index: 0, maxX: 1 }],
+    },
+  });
+  assert.equal(res.statusCode, 422);
+  assert.equal(res.json().code, 'TARGET_UNREACHABLE');
+});
+
+test('POST /schemes/:name/reverse：方案不存在 → 404；未标可调层 → 400', async () => {
+  const r1 = await app.inject({
+    method: 'POST',
+    url: '/schemes/nope/reverse',
+    payload: { target: { metric: 'broadTransmission', limit: 0.1 } },
+  });
+  assert.equal(r1.statusCode, 404);
+  assert.equal(r1.json().code, 'SCHEME_NOT_FOUND');
+
+  const r2 = await app.inject({
+    method: 'POST',
+    url: '/schemes/demo-pb-unit-hvl/reverse',
+    payload: { target: { metric: 'broadTransmission', limit: 0.1 } },
+  });
+  assert.equal(r2.statusCode, 400);
+  assert.ok(r2.json().details.some((d) => d.field === 'layers'));
+});

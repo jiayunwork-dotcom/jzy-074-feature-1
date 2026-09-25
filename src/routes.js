@@ -2,8 +2,16 @@
  * HTTP 路由层。只负责解析/校验输入、调用存储模块与物理核心模块、
  * 组织响应。衰减公式一律来自 src/physics，路由层不自行推导。
  */
-import { validateSingleCalcBody, validateSchemeCalcBody, validateRegisterBody, validateNameParam } from './physics/validation.js';
+import {
+  validateSingleCalcBody,
+  validateSchemeCalcBody,
+  validateRegisterBody,
+  validateNameParam,
+  validateReverseBody,
+  validateSchemeReverseBody,
+} from './physics/validation.js';
 import { evaluateShielding } from './physics/multilayer.js';
+import { reverseSolve } from './physics/reverse.js';
 import { registerScheme, getScheme, listSchemes } from './storage/schemes.js';
 
 /**
@@ -48,6 +56,20 @@ export function registerRoutes(app, db) {
   });
 
   /**
+   * 4) 凭方案名按目标反求最小厚度（只在允许加厚的层上加增量）
+   * POST /schemes/:name/reverse
+   * body: { target: { metric, limit }, adjustable?: [...], fluenceRate?, buildup? }
+   * 沿用已登记的层结构与各层当前厚度；adjustable 标明可加厚的层（下标/材料名/对象）。
+   */
+  app.post('/schemes/:name/reverse', async (request) => {
+    const name = validateNameParam(request.params.name);
+    const scheme = getScheme(db, name); // 不存在在此抛 404
+    const { layers, target, fluenceRate, buildup } = validateSchemeReverseBody(request.body, scheme.layers);
+    const result = reverseSolve(layers, { target, fluenceRate, buildup });
+    return { scheme: name, ...result };
+  });
+
+  /**
    * 3) 不登记的一次性单层核算
    * POST /calculate
    * body: { mu, x, material?, fluenceRate?, buildup? }
@@ -56,5 +78,20 @@ export function registerRoutes(app, db) {
   app.post('/calculate', async (request) => {
     const { layer, fluenceRate, buildup } = validateSingleCalcBody(request.body);
     return evaluateShielding([layer], { fluenceRate, buildup });
+  });
+
+  /**
+   * 5) 不登记的一次性反解：给目标限值与材料，求达标所需的最小厚度
+   * POST /reverse
+   * body: { layers: [{ mu, x, adjustable?, maxX?, weight?, material? }],
+   *         target: { metric: 'broadTransmission'|'relativeDoseRate', limit },
+   *         fluenceRate?, buildup? }
+   * 单层也可平铺 { mu, x, adjustable, ... } 或用 layer 包裹。
+   * 返回达标厚度配置 + 该配置代回正向核算的完整结果。
+   * 顶到各可调层上限仍不达标 → 422 TARGET_UNREACHABLE。
+   */
+  app.post('/reverse', async (request) => {
+    const { layers, target, fluenceRate, buildup } = validateReverseBody(request.body);
+    return reverseSolve(layers, { target, fluenceRate, buildup });
   });
 }
